@@ -1,95 +1,64 @@
-# Anki-My
+# Frontend — Anki-My
 
-[Link to backend](https://github.com/Nubzzin/Anki-my-backend)
+Single-page application built with React 19, TypeScript, and Vite. Communicates with the Rocket backend via REST API.
 
-A simple, modern, full-stack flashcard app inspired by Anki, built with **React**, **TypeScript**, and **Rust (Rocket)**.
+## Tech
 
-Host your own spaced repetition learning platform — no ads, no tracking, just study.
+- React 19 + TypeScript
+- Vite 7
+- TailwindCSS 4
+- React Router v7
 
-## Screenshots
+## Environment Variables
 
-### Login Page
+Create a `.env` file in `/frontend`:
 
-![Login Screenshot](./public/screenshots/login.png)
-
-### Home Page
-
-![Home Screenshot](./public/screenshots/decks.png)
-
-### Decks View
-
-![Decks Screenshot](./public/screenshots/decks.png)
-
-### Shared Decks
-
-![Shared Decks Screenshot](./public/screenshots/shared.png)
-
-### Add Deck
-
-![Add Deck Screenshot](./public/screenshots/new.png)
-
-### Cards Page
-
-![Cards Screenshot](./public/screenshots/cards.png)
-![Cardsback Screenshot](./public/screenshots/cardsback.png)
-
-## Features
-
-- 🔐 User authentication (JWT-based)
-- 📚 Create, manage and review decks
-- 🃏 Add and edit cards
-- 🔍 Filter decks by name
-- ☁️ Hosted frontend and backend (Railway)
-
-## Tech Stack
-
-### Frontend
-
-- [React](https://react.dev/)
-- [TypeScript](https://www.typescriptlang.org/)
-- [Vite](https://vitejs.dev/)
-- TailwindCSS
-
-### Backend
-
-- [Rust](https://www.rust-lang.org/) with [Rocket](https://rocket.rs/)
-- JWT for authentication
-- PostgreSQL (via Railway)
-- CORS & API endpoints for frontend
-
-## 🚀 Getting Started
-
-### Prerequisites
-
-- Node.js + npm
-- Rust + Cargo
-- PostgreSQL
-
----
-
-## 📦 Installation
-
-### Clone the repo
-
-```bash
-git clone https://github.com/yourusername/anki-my.git
-cd anki-my
+```env
+VITE_API_URL=http://localhost:8000
 ```
 
-### Setup Frontend
+For production, set this to your deployed backend URL.
+
+## Run
 
 ```bash
-cd frontend
 npm install
-cp .env.example .env  # Set VITE_API_URL to your backend URL
-npm run dev            # Or: npm run build && npm run preview
+npm run dev       # development — http://localhost:5173
+npm run build     # production build → dist/
+npm run preview   # preview production build locally
 ```
 
-### Setup Backend
+## Pages & Routes
 
-```bash
-cd backend
-cargo build
-# Set environment variables (e.g., DATABASE_URL, JWT_SECRET)
-cargo run
+| Route | Page | Auth required |
+|---|---|---|
+| `/login` | LoginPage | No |
+| `/register` | RegisterPage | No |
+| `/` | DashboardPage (deck list) | Yes |
+| `/deck/new` | NewDeckPage | Yes |
+| `/deck/:id` | DeckPage (cards list) | Yes |
+| `/deck/:id/study` | DeckStudyPage (flashcard flip) | Yes |
+| `/deck/shared` | SharedPage (public decks) | Yes |
+
+Protected routes redirect to `/login` if no token is found in `localStorage`.
+
+## Project Structure
+
 ```
+src/
+├── App.tsx                          # Route definitions
+├── main.tsx                         # React entry point
+├── pages/                           # One file per route
+├── components/
+│   ├── DeckComponent.tsx            # Deck card UI
+│   ├── SidebarComponent.tsx         # Navigation sidebar
+│   └── ProtectedRouteComponent.tsx  # Auth guard
+├── services/
+│   └── api.ts                       # All fetch calls to the backend
+└── utils/
+    └── models.ts                    # Deck and Card classes
+```
+
+## API Integration
+
+All requests go through `src/services/api.ts`. The base URL comes from `VITE_API_URL`. JWT token is stored in `localStorage` under the key `token` and sent as `Authorization: Bearer <token>` on authenticated requests.
