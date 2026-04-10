@@ -1,95 +1,100 @@
-# Anki-My
+# Backend — Anki-My
 
-[Link to frontend](https://github.com/Nubzzin/Anki-my-frontend)
+REST API built with Rust and [Rocket](https://rocket.rs/). Handles authentication, deck and card management, and serves data to the frontend.
 
-A simple, modern, full-stack flashcard app inspired by Anki, built with **React**, **TypeScript**, and **Rust (Rocket)**.
+## Tech
 
-Host your own spaced repetition learning platform — no ads, no tracking, just study.
+- Rust (edition 2024)
+- Rocket 0.5 + rocket_cors
+- SQLx + PostgreSQL
+- JWT (jsonwebtoken) + bcrypt
+- UUID v4 for all IDs
 
-## Screenshots
+## Environment Variables
 
-### Login Page
+Create a `.env` file in `/backend`:
 
-![Login Screenshot](./public/screenshots/login.png)
-
-### Home Page
-
-![Home Screenshot](./public/screenshots/decks.png)
-
-### Decks View
-
-![Decks Screenshot](./public/screenshots/decks.png)
-
-### Shared Decks
-
-![Shared Decks Screenshot](./public/screenshots/shared.png)
-
-### Add Deck
-
-![Add Deck Screenshot](./public/screenshots/new.png)
-
-### Cards Page
-
-![Cards Screenshot](./public/screenshots/cards.png)
-![Cardsback Screenshot](./public/screenshots/cardsback.png)
-
-## Features
-
-- 🔐 User authentication (JWT-based)
-- 📚 Create, manage and review decks
-- 🃏 Add and edit cards
-- 🔍 Filter decks by name
-- ☁️ Hosted frontend and backend (Railway)
-
-## Tech Stack
-
-### Frontend
-
-- [React](https://react.dev/)
-- [TypeScript](https://www.typescriptlang.org/)
-- [Vite](https://vitejs.dev/)
-- TailwindCSS
-
-### Backend
-
-- [Rust](https://www.rust-lang.org/) with [Rocket](https://rocket.rs/)
-- JWT for authentication
-- PostgreSQL (via Railway)
-- CORS & API endpoints for frontend
-
-## 🚀 Getting Started
-
-### Prerequisites
-
-- Node.js + npm
-- Rust + Cargo
-- PostgreSQL
-
----
-
-## 📦 Installation
-
-### Clone the repo
-
-```bash
-git clone https://github.com/yourusername/anki-my.git
-cd anki-my
+```env
+DATABASE_URL=postgres://user:password@localhost/ankimy
+JWT_SECRET=your_secret_here
+ROCKET_SECRET_KEY=your_rocket_key_here
 ```
 
-### Setup Frontend
+## Run
 
 ```bash
-cd frontend
-npm install
-cp .env.example .env  # Set VITE_API_URL to your backend URL
-npm run dev            # Or: npm run build && npm run preview
-```
-
-### Setup Backend
-
-```bash
-cd backend
-cargo build
-# Set environment variables (e.g., DATABASE_URL, JWT_SECRET)
 cargo run
+```
+
+Runs on port `8000` by default (`Rocket.toml`).
+
+## API Endpoints
+
+### Auth
+
+| Method | Route | Auth | Description |
+|---|---|---|---|
+| POST | `/login` | No | Returns JWT token |
+| POST | `/register` | No | Creates user, returns JWT token |
+
+**Request body (both):**
+```json
+{ "username": "string", "password": "string" }
+```
+
+**Response:**
+```json
+{ "token": "eyJ..." }
+```
+
+### Decks
+
+All deck routes require `Authorization: Bearer <token>`.
+
+| Method | Route | Description |
+|---|---|---|
+| GET | `/deck` | List decks owned by the authenticated user |
+| POST | `/deck/new` | Create a new deck |
+| GET | `/deck/shared` | List all public shared decks |
+| GET | `/deck/:id/card` | List all cards in a deck |
+
+**POST `/deck/new` body:**
+```json
+{ "name": "string" }
+```
+
+Returns `409 Conflict` if deck name already exists.
+
+## Project Structure
+
+```
+src/
+├── main.rs         # Route handlers, CORS config, Rocket setup
+├── models/mod.rs   # Structs: User, Deck, Card, AuthUser, Claims
+├── db.rs           # PostgreSQL connection pool (SQLx)
+└── utils/mod.rs    # JWT generate/verify helpers
+```
+
+## Database Schema (expected)
+
+```sql
+CREATE TABLE users (
+    id       TEXT PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL
+);
+
+CREATE TABLE decks (
+    id        TEXT PRIMARY KEY,
+    name      TEXT NOT NULL,
+    user_id   TEXT REFERENCES users(id),
+    is_shared BOOLEAN DEFAULT false
+);
+
+CREATE TABLE cards (
+    id      TEXT PRIMARY KEY,
+    front   TEXT NOT NULL,
+    back    TEXT NOT NULL,
+    deck_id TEXT REFERENCES decks(id)
+);
 ```
