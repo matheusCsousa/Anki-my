@@ -1,26 +1,9 @@
-use std::env;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 
-use sqlx::{
-    Pool, Postgres,
-    postgres::{PgPoolOptions, PgRow},
-};
-
-pub struct Db {
-    pool: Pool<Postgres>,
-}
-
-impl Db {
-    pub async fn connect() -> Result<Self, sqlx::Error> {
-        let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&db_url)
-            .await?;
-
-        Ok(Db { pool })
-    }
-
-    pub fn pool(&self) -> &Pool<Postgres> {
-        &self.pool
-    }
+pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(20))
+        .connect(url)
+        .await
 }

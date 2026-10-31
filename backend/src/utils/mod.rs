@@ -1,36 +1,100 @@
+use crate::models::Claims;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{EncodingKey, Header, encode};
 
-pub fn generate_token(user_id: &str, secret: &str) -> String {
-    let expiration = Utc::now()
-        .checked_add_signed(Duration::hours(24))
-        .unwrap()
-        .timestamp();
-
+pub fn generate_token(user_id: &str, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let claims = Claims {
         sub: user_id.to_string(),
-        exp: expiration as usize,
+        exp: (Utc::now() + Duration::hours(24)).timestamp() as usize,
     };
-
     encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(secret.as_ref()),
+        &EncodingKey::from_secret(secret.as_bytes()),
     )
-    .expect("Token creation failed")
 }
 
-use jsonwebtoken::{DecodingKey, Validation, decode};
+// A small interval scheduler for the first release; this is not Anki's FSRS algorithm.
+pub fn next_interval(previous: i32, grade: &str) -> Option<i32> {
+    let days = match grade {
+        "again" => 0,
+        "hard" => (previous as f64 * 1.2).ceil() as i32,
+        "good" => previous.saturating_mul(2).max(3),
+        "easy" => previous.saturating_mul(3).max(7),
+        _ => return None,
+    };
+    Some(if grade == "again" {
+        0
+    } else {
+        days.clamp(1, 365)
+    })
+}
 
-use crate::models::Claims;
-
-pub fn verify_token(token: &str, secret: &str) -> Option<String> {
-    let decoded = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(secret.as_ref()),
-        &Validation::default(),
-    )
-    .ok()?;
-
-    Some(decoded.claims.sub)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn grades_schedule_different_intervals() {
+        assert_eq!(next_interval(0, "again"), Some(0));
+        assert_eq!(next_interval(0, "hard"), Some(1));
+        assert_eq!(next_interval(0, "good"), Some(3));
+        assert_eq!(next_interval(0, "easy"), Some(7));
+        assert_eq!(next_interval(10, "good"), Some(20));
+        assert_eq!(next_interval(300, "easy"), Some(365));
+        assert_eq!(next_interval(5, "invalid"), None);
+    }
+    #[test]
+    fn signed_tokens_require_the_correct_secret() {
+        let token = generate_token("user-1", "test-secret").unwrap();
+        let valid = jsonwebtoken::decode::<Claims>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_secret(b"test-secret"),
+            &jsonwebtoken::Validation::default(),
+        )
+        .unwrap();
+        assert_eq!(valid.claims.sub, "user-1");
+        assert!(
+            jsonwebtoken::decode::<Claims>(
+                &token,
+                &jsonwebtoken::DecodingKey::from_secret(b"other-secret"),
+                &jsonwebtoken::Validation::default()
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn expired_tokens_and_unexpected_algorithms_are_rejected() {
+        let key = jsonwebtoken::EncodingKey::from_secret(b"test-secret");
+        let expired = Claims {
+            sub: "user-1".into(),
+            exp: 1,
+        };
+        let token = jsonwebtoken::encode(&jsonwebtoken::Header::default(), &expired, &key).unwrap();
+        assert!(
+            jsonwebtoken::decode::<Claims>(
+                &token,
+                &jsonwebtoken::DecodingKey::from_secret(b"test-secret"),
+                &jsonwebtoken::Validation::default()
+            )
+            .is_err()
+        );
+        let claims = Claims {
+            sub: "user-1".into(),
+            exp: (Utc::now() + Duration::hours(1)).timestamp() as usize,
+        };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS384),
+            &claims,
+            &key,
+        )
+        .unwrap();
+        assert!(
+            jsonwebtoken::decode::<Claims>(
+                &token,
+                &jsonwebtoken::DecodingKey::from_secret(b"test-secret"),
+                &jsonwebtoken::Validation::default()
+            )
+            .is_err()
+        );
+    }
 }

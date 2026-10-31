@@ -1,8 +1,7 @@
-
 [default]
-# address = "0.0.0.0"
+address = "0.0.0.0"
 port = 8000
+limits = { json = "64 KiB" }
 
 [release]
 log_level = "normal"
-secret_key = { env = "ROCKET_SECRET_KEY" }
