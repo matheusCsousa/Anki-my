@@ -1,315 +1,732 @@
 #[macro_use]
 extern crate rocket;
-
-use std::env;
-
-use db::Db;
-use dotenv::dotenv;
-use models::{AuthUser, CORS, Deck, User};
-use rocket::{http::Status, serde::json::Json};
-use sqlx::{Row, postgres::PgRow};
-
-use rocket_cors::{AllowedHeaders, AllowedOrigins, CorsOptions};
-use std::str::FromStr;
-
-use models::{LoginRequest, LoginResponse};
-use utils::generate_token;
-
-use crate::{
-    models::{Card, NewDeckRequest, RegisterRequest},
-    utils::verify_token,
-};
-
 mod db;
+mod headers;
 mod models;
 mod utils;
+use models::*;
+use rocket::fs::{FileServer, NamedFile};
+use rocket::{
+    State,
+    http::{Method, Status},
+    serde::json::Json,
+};
+use rocket_cors::{AllowedHeaders, AllowedOrigins, CorsOptions};
+use sqlx::{PgPool, Row};
+use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+use uuid::Uuid;
 
-#[post("/login", data = "<data>")]
-async fn login(data: Json<LoginRequest>) -> Result<Json<LoginResponse>, Status> {
-    let db = Db::connect()
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    let user = sqlx::query("SELECT * FROM users WHERE username = $1")
-        .bind(&data.username)
-        .map(|row: PgRow| {
-            let id = row.try_get("id").unwrap();
-            let username = row.try_get("username").unwrap();
-            let password = row.try_get("password").unwrap();
-            User {
-                id,
-                username,
-                password,
-            }
-        })
-        .fetch_optional(db.pool())
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    let user = match user {
-        Some(u) => u,
-        None => return Err(Status::Unauthorized),
-    };
-
-    let is_valid =
-        bcrypt::verify(&data.password, &user.password).map_err(|_| Status::InternalServerError)?;
-
-    if !is_valid {
-        return Err(Status::Unauthorized);
+#[derive(Default)]
+struct AuthThrottle(Mutex<HashMap<String, (Instant, u32)>>);
+impl AuthThrottle {
+    fn allow(&self, username: &str) -> bool {
+        let Ok(mut attempts) = self.0.lock() else {
+            return false;
+        };
+        attempts.retain(|_, (start, _)| start.elapsed() < Duration::from_secs(60));
+        // Bound both CPU spent on password hashing and memory consumed by arbitrary names.
+        let global = attempts.entry("*".into()).or_insert((Instant::now(), 0));
+        if global.1 >= 120 {
+            return false;
+        }
+        global.1 += 1;
+        if attempts.len() >= 500 {
+            return false;
+        }
+        let entry = attempts
+            .entry(format!("user:{username}"))
+            .or_insert((Instant::now(), 0));
+        if entry.1 >= 10 {
+            return false;
+        }
+        entry.1 += 1;
+        true
     }
-
-    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
-    let token = generate_token(&user.id, &secret);
-
-    Ok(Json(LoginResponse { token }))
 }
-
-#[post("/register", data = "<data>")]
-async fn register(data: Json<RegisterRequest>) -> Result<Json<LoginResponse>, Status> {
-    use uuid::Uuid;
-
-    let db = Db::connect()
+fn db_error(error: sqlx::Error) -> Status {
+    if let sqlx::Error::Database(ref db) = error {
+        if db.is_unique_violation() {
+            return Status::Conflict;
+        }
+    }
+    eprintln!("Database operation failed: {error}");
+    Status::InternalServerError
+}
+fn valid_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.chars().count() <= 100
+}
+fn valid_card(card: &CardInput) -> bool {
+    [&card.front, &card.back]
+        .iter()
+        .all(|s| !s.trim().is_empty() && s.chars().count() <= 10000)
+}
+#[get("/health")]
+async fn health(pool: &State<PgPool>) -> Result<&'static str, Status> {
+    sqlx::query("SELECT 1")
+        .execute(pool.inner())
         .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    if data.username.trim().is_empty() || data.password.trim().is_empty() {
+        .map_err(db_error)?;
+    Ok("ok")
+}
+#[post("/register", data = "<data>")]
+async fn register(
+    data: Json<Credentials>,
+    pool: &State<PgPool>,
+    secret: &State<JwtSecret>,
+    throttle: &State<AuthThrottle>,
+) -> Result<Json<LoginResponse>, Status> {
+    let username = data.username.trim();
+    if username.len() < 3
+        || username.len() > 40
+        || !username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        || data.password.len() < 8
+        || data.password.len() > 72
+    {
         return Err(Status::BadRequest);
     }
-
-    let existing_user =
-        sqlx::query_scalar::<_, String>("SELECT username FROM users WHERE username = $1")
-            .bind(&data.username)
-            .fetch_optional(db.pool())
+    if !throttle.allow(username) {
+        return Err(Status::TooManyRequests);
+    }
+    let password = data.password.clone();
+    let hash =
+        rocket::tokio::task::spawn_blocking(move || bcrypt::hash(password, bcrypt::DEFAULT_COST))
             .await
+            .map_err(|_| Status::InternalServerError)?
             .map_err(|_| Status::InternalServerError)?;
-
-    if existing_user.is_some() {
-        return Err(Status::Conflict);
-    }
-
-    let hashed_password = bcrypt::hash(&data.password, bcrypt::DEFAULT_COST)
-        .map_err(|_| Status::InternalServerError)?;
-
-    let user_id = Uuid::new_v4().to_string();
-
-    let result = sqlx::query("INSERT INTO users (id, username, password) VALUES ($1, $2, $3)")
-        .bind(&user_id)
-        .bind(&data.username)
-        .bind(&hashed_password)
-        .execute(db.pool())
-        .await;
-
-    if let Err(e) = result {
-        eprintln!("Failed to create user: {:?}", e);
-        return Err(Status::InternalServerError);
-    }
-
-    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
-    let token = generate_token(&user_id, &secret);
-
-    Ok(Json(LoginResponse { token }))
+    let id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO users(id, username, password) VALUES($1,$2,$3)")
+        .bind(&id)
+        .bind(username)
+        .bind(hash)
+        .execute(pool.inner())
+        .await
+        .map_err(db_error)?;
+    Ok(Json(LoginResponse {
+        token: utils::generate_token(&id, &secret.0).map_err(|_| Status::InternalServerError)?,
+    }))
 }
-
-#[get("/deck")]
-async fn deck(user: AuthUser) -> Result<Json<Vec<Deck>>, Status> {
-    let db = Db::connect()
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    let decks = sqlx::query("SELECT * FROM decks WHERE user_id = $1")
-        .bind(&user.user_id)
-        .map(|row: PgRow| {
-            let id = row.try_get("id").unwrap();
-            let name = row.try_get("name").unwrap();
-            Deck { id, name }
-        })
-        .fetch_all(db.pool())
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    Ok(Json(decks))
-}
-
-#[get("/deck/<deck_id>/card")]
-async fn cards_deck(deck_id: String, user: AuthUser) -> Result<Json<Vec<Card>>, Status> {
-    let db = Db::connect()
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    let cards = sqlx::query("SELECT * FROM cards WHERE deck_id = $1")
-        .bind(&deck_id)
-        .map(|row: PgRow| {
-            let id = row.try_get("id").unwrap();
-            let front = row.try_get("front").unwrap();
-            let back = row.try_get("back").unwrap();
-            Card { id, front, back }
-        })
-        .fetch_all(db.pool())
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    Ok(Json(cards))
-}
-
-#[post("/deck/new", data = "<data>")]
-async fn deck_new(user: AuthUser, data: Json<NewDeckRequest>) -> Result<Json<Deck>, Status> {
-    use uuid::Uuid;
-
-    let db = Db::connect()
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    let existing_deck = sqlx::query_scalar::<_, String>("SELECT name FROM decks WHERE name = $1")
-        .bind(&data.name)
-        .fetch_optional(db.pool())
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    if existing_deck.is_some() {
-        return Err(Status::Conflict);
+#[post("/login", data = "<data>")]
+async fn login(
+    data: Json<Credentials>,
+    pool: &State<PgPool>,
+    secret: &State<JwtSecret>,
+    throttle: &State<AuthThrottle>,
+) -> Result<Json<LoginResponse>, Status> {
+    let username = data.username.trim();
+    if username.len() > 100 || data.password.len() > 72 {
+        return Err(Status::Unauthorized);
     }
-
-    let deck = Deck {
-        id: Uuid::new_v4().to_string(),
-        name: data.name.clone(),
+    if !throttle.allow(username) {
+        return Err(Status::TooManyRequests);
+    }
+    let row = sqlx::query("SELECT id, password FROM users WHERE username=$1")
+        .bind(username)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(db_error)?;
+    let Some(row) = row else {
+        return Err(Status::Unauthorized);
     };
-
-    let result = sqlx::query("INSERT INTO decks (id, name, user_id) VALUES ($1, $2, $3)")
-        .bind(&deck.id)
-        .bind(&deck.name)
+    let id: String = row.get("id");
+    let hash: String = row.get("password");
+    let password = data.password.clone();
+    let valid = rocket::tokio::task::spawn_blocking(move || bcrypt::verify(password, &hash))
+        .await
+        .map_err(|_| Status::InternalServerError)?
+        .map_err(|_| Status::InternalServerError)?;
+    if !valid {
+        return Err(Status::Unauthorized);
+    }
+    Ok(Json(LoginResponse {
+        token: utils::generate_token(&id, &secret.0).map_err(|_| Status::InternalServerError)?,
+    }))
+}
+const DECK_QUERY: &str = "SELECT d.id, d.name, COALESCE(d.is_shared,false) AS is_shared, d.user_id=$1 AS is_owner, COUNT(c.id) AS card_count, COUNT(c.id) FILTER (WHERE r.due_at IS NULL OR r.due_at <= NOW()) AS due_count FROM decks d LEFT JOIN cards c ON c.deck_id=d.id LEFT JOIN card_reviews r ON r.card_id=c.id AND r.user_id=$1";
+#[get("/deck")]
+async fn decks(user: AuthUser, pool: &State<PgPool>) -> Result<Json<Vec<Deck>>, Status> {
+    let query = format!("{DECK_QUERY} WHERE d.user_id=$1 GROUP BY d.id ORDER BY d.name");
+    Ok(Json(
+        sqlx::query_as::<_, Deck>(&query)
+            .bind(user.user_id)
+            .fetch_all(pool.inner())
+            .await
+            .map_err(db_error)?,
+    ))
+}
+#[get("/deck/shared", rank = 1)]
+async fn shared(user: AuthUser, pool: &State<PgPool>) -> Result<Json<Vec<Deck>>, Status> {
+    let query =
+        format!("{DECK_QUERY} WHERE d.is_shared=true GROUP BY d.id ORDER BY d.name LIMIT 200");
+    Ok(Json(
+        sqlx::query_as::<_, Deck>(&query)
+            .bind(user.user_id)
+            .fetch_all(pool.inner())
+            .await
+            .map_err(db_error)?,
+    ))
+}
+#[get("/deck/<id>", rank = 2)]
+async fn get_deck(id: &str, user: AuthUser, pool: &State<PgPool>) -> Result<Json<Deck>, Status> {
+    let query =
+        format!("{DECK_QUERY} WHERE d.id=$2 AND (d.user_id=$1 OR d.is_shared=true) GROUP BY d.id");
+    sqlx::query_as::<_, Deck>(&query)
+        .bind(user.user_id)
+        .bind(id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(db_error)?
+        .map(Json)
+        .ok_or(Status::NotFound)
+}
+async fn can_access(pool: &PgPool, user: &str, deck: &str, owner_only: bool) -> Result<(), Status> {
+    let allowed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM decks WHERE id=$1 AND (user_id=$2 OR (is_shared=true AND NOT $3)))").bind(deck).bind(user).bind(owner_only).fetch_one(pool).await.map_err(db_error)?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(Status::NotFound)
+    }
+}
+#[post("/deck/new", data = "<data>")]
+async fn new_deck(
+    data: Json<DeckInput>,
+    user: AuthUser,
+    pool: &State<PgPool>,
+) -> Result<Json<Deck>, Status> {
+    if !valid_name(&data.name) {
+        return Err(Status::BadRequest);
+    }
+    let id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO decks(id,name,user_id,is_shared) VALUES($1,$2,$3,$4)")
+        .bind(&id)
+        .bind(data.name.trim())
         .bind(&user.user_id)
-        .execute(db.pool())
-        .await;
-
-    if let Err(e) = result {
-        eprintln!("Failed to create deck: {:?}", e);
-        return Err(Status::InternalServerError);
+        .bind(data.is_shared)
+        .execute(pool.inner())
+        .await
+        .map_err(db_error)?;
+    get_deck(&id, user, pool).await
+}
+#[put("/deck/<id>", data = "<data>")]
+async fn update_deck(
+    id: &str,
+    data: Json<DeckInput>,
+    user: AuthUser,
+    pool: &State<PgPool>,
+) -> Result<Json<Deck>, Status> {
+    if !valid_name(&data.name) {
+        return Err(Status::BadRequest);
     }
-
-    Ok(Json(deck))
-}
-
-#[get("/deck/shared")]
-async fn deck_shared(user: AuthUser) -> Result<Json<Vec<Deck>>, Status> {
-    let db = Db::connect()
+    let result = sqlx::query("UPDATE decks SET name=$1,is_shared=$2 WHERE id=$3 AND user_id=$4")
+        .bind(data.name.trim())
+        .bind(data.is_shared)
+        .bind(id)
+        .bind(&user.user_id)
+        .execute(pool.inner())
         .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    let decks = sqlx::query("SELECT * FROM decks WHERE is_shared = true")
-        .map(|row: PgRow| {
-            let id = row.try_get("id").unwrap();
-            let name = row.try_get("name").unwrap();
-            Deck { id, name }
-        })
-        .fetch_all(db.pool())
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-
-    Ok(Json(decks))
-}
-
-// #[get("/deck/<id>")]
-// async fn deck_id(id: String) -> Json<Deck> {
-//     Json(Deck {
-//         id: id.clone(),
-//         name: format!("Deck {}", id),
-//         description: format!("Description for Deck {}", id),
-//         cards: vec![
-//             Card {
-//                 id: "1".into(),
-//                 front: format!("Front 1 for Deck {}", id),
-//                 back: format!("Back 1 for Deck {}", id),
-//             },
-//             Card {
-//                 id: "2".into(),
-//                 front: format!("Front 2 for Deck {}", id),
-//                 back: format!("Back 2 for Deck {}", id),
-//             },
-//         ],
-//     })
-// }
-
-// Test
-#[get("/rows")]
-async fn rows() -> Json<Vec<User>> {
-    let db = Db::connect().await.unwrap();
-    let rows = sqlx::query("SELECT * FROM users")
-        .map(|row: PgRow| {
-            let id = row.try_get("id").unwrap();
-            let username = row.try_get("username").unwrap();
-            let password = row.try_get("password").unwrap();
-            User {
-                id,
-                username,
-                password,
-            }
-        })
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
-
-    Json(rows)
-}
-
-#[get("/protected")]
-fn protected(user: Option<AuthUser>) -> Result<String, Status> {
-    match user {
-        Some(u) => Ok(format!("Hello, user with id: {}", u.user_id)),
-        None => Err(Status::Unauthorized),
+        .map_err(db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(Status::NotFound);
     }
+    get_deck(id, user, pool).await
 }
-
-#[options("/<_..>")]
-fn all_options() -> &'static str {
-    ""
+#[delete("/deck/<id>")]
+async fn delete_deck(id: &str, user: AuthUser, pool: &State<PgPool>) -> Result<Status, Status> {
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    // Lock the parent to serialize deletion with card inserts, including legacy schemas.
+    let owned = sqlx::query("SELECT id FROM decks WHERE id=$1 AND user_id=$2 FOR UPDATE")
+        .bind(id)
+        .bind(&user.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+    if owned.is_none() {
+        return Err(Status::NotFound);
+    }
+    sqlx::query(
+        "DELETE FROM card_reviews WHERE card_id IN (SELECT id FROM cards WHERE deck_id=$1)",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_error)?;
+    sqlx::query("DELETE FROM cards WHERE deck_id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+    sqlx::query("DELETE FROM decks WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Status::NoContent)
 }
-
-#[rocket::main]
-async fn main() -> Result<(), Box<rocket::Error>> {
-    dotenv().ok();
-
-    let allowed_origins =
-        AllowedOrigins::some_exact(&["https://anki-my.up.railway.app", "http://localhost:3000"]);
-
-    let cors = CorsOptions::default()
-        .allowed_origins(AllowedOrigins::some_exact(&[
-            "https://anki-my.up.railway.app",
-            "http://localhost:3000",
-        ]))
-        .allowed_methods(
-            vec!["GET", "POST", "OPTIONS"]
-                .into_iter()
-                .map(|s| s.parse().unwrap())
-                .collect(),
-        )
-        .allowed_headers(AllowedHeaders::some(&[
-            "Authorization",
-            "Accept",
-            "Content-Type",
-            "Origin",
-        ]))
-        .allow_credentials(true)
-        .to_cors()
-        .expect("CORS configuration failed");
-
-    let _rocket = rocket::build()
-        .attach(CORS)
+#[get("/deck/<id>/card")]
+async fn cards(id: &str, user: AuthUser, pool: &State<PgPool>) -> Result<Json<Vec<Card>>, Status> {
+    can_access(pool, &user.user_id, id, false).await?;
+    Ok(Json(sqlx::query_as::<_, Card>("SELECT c.id,c.front,c.back,(r.due_at IS NULL OR r.due_at<=NOW()) AS due FROM cards c LEFT JOIN card_reviews r ON r.card_id=c.id AND r.user_id=$1 WHERE c.deck_id=$2 ORDER BY c.id").bind(user.user_id).bind(id).fetch_all(pool.inner()).await.map_err(db_error)?))
+}
+#[post("/deck/<id>/card", data = "<data>")]
+async fn add_card(
+    id: &str,
+    data: Json<CardInput>,
+    user: AuthUser,
+    pool: &State<PgPool>,
+) -> Result<Json<Card>, Status> {
+    if !valid_card(&data) {
+        return Err(Status::BadRequest);
+    }
+    let card_id = Uuid::new_v4().to_string();
+    let result = sqlx::query("INSERT INTO cards(id,front,back,deck_id) SELECT $1,$2,$3,id FROM decks WHERE id=$4 AND user_id=$5").bind(&card_id).bind(data.front.trim()).bind(data.back.trim()).bind(id).bind(user.user_id).execute(pool.inner()).await.map_err(db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(Status::NotFound);
+    }
+    Ok(Json(Card {
+        id: card_id,
+        front: data.front.trim().into(),
+        back: data.back.trim().into(),
+        due: true,
+    }))
+}
+#[put("/deck/<id>/card/<card_id>", data = "<data>")]
+async fn update_card(
+    id: &str,
+    card_id: &str,
+    data: Json<CardInput>,
+    user: AuthUser,
+    pool: &State<PgPool>,
+) -> Result<Status, Status> {
+    if !valid_card(&data) {
+        return Err(Status::BadRequest);
+    }
+    let result = sqlx::query("UPDATE cards SET front=$1,back=$2 WHERE id=$3 AND deck_id=$4 AND EXISTS(SELECT 1 FROM decks WHERE id=$4 AND user_id=$5)").bind(data.front.trim()).bind(data.back.trim()).bind(card_id).bind(id).bind(user.user_id).execute(pool.inner()).await.map_err(db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(Status::NotFound);
+    }
+    Ok(Status::NoContent)
+}
+#[delete("/deck/<id>/card/<card_id>")]
+async fn delete_card(
+    id: &str,
+    card_id: &str,
+    user: AuthUser,
+    pool: &State<PgPool>,
+) -> Result<Status, Status> {
+    let result = sqlx::query("DELETE FROM cards WHERE id=$1 AND deck_id=$2 AND EXISTS(SELECT 1 FROM decks WHERE id=$2 AND user_id=$3)").bind(card_id).bind(id).bind(user.user_id).execute(pool.inner()).await.map_err(db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(Status::NotFound);
+    }
+    Ok(Status::NoContent)
+}
+#[post("/deck/<id>/card/<card_id>/review", data = "<data>")]
+async fn review(
+    id: &str,
+    card_id: &str,
+    data: Json<ReviewInput>,
+    user: AuthUser,
+    pool: &State<PgPool>,
+) -> Result<Status, Status> {
+    if utils::next_interval(0, &data.grade).is_none() {
+        return Err(Status::BadRequest);
+    }
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let accessible = sqlx::query("SELECT c.id FROM cards c JOIN decks d ON d.id=c.deck_id WHERE c.id=$1 AND d.id=$2 AND (d.user_id=$3 OR d.is_shared=true) FOR SHARE OF c,d").bind(card_id).bind(id).bind(&user.user_id).fetch_optional(&mut *tx).await.map_err(db_error)?;
+    if accessible.is_none() {
+        return Err(Status::NotFound);
+    }
+    sqlx::query("INSERT INTO card_reviews(user_id,card_id,review_count) VALUES($1,$2,0) ON CONFLICT DO NOTHING").bind(&user.user_id).bind(card_id).execute(&mut *tx).await.map_err(db_error)?;
+    let previous: i32 = sqlx::query_scalar(
+        "SELECT interval_days FROM card_reviews WHERE user_id=$1 AND card_id=$2 FOR UPDATE",
+    )
+    .bind(&user.user_id)
+    .bind(card_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_error)?;
+    let days = utils::next_interval(previous, &data.grade).ok_or(Status::BadRequest)?;
+    let seconds = if days == 0 { 60 } else { days * 86400 };
+    sqlx::query("UPDATE card_reviews SET interval_days=$1,due_at=NOW()+($2::int*INTERVAL '1 second'),reviewed_at=NOW(),review_count=review_count+1 WHERE user_id=$3 AND card_id=$4").bind(days).bind(seconds).bind(user.user_id).bind(card_id).execute(&mut *tx).await.map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Status::NoContent)
+}
+#[get("/<path..>", rank = 20)]
+async fn spa(path: PathBuf) -> Option<NamedFile> {
+    // Unknown API paths must remain real 404s rather than returning index.html.
+    if path
+        .components()
+        .next()
+        .is_some_and(|p| p.as_os_str() == "api")
+    {
+        return None;
+    }
+    let dist = std::env::var("FRONTEND_DIST").unwrap_or_else(|_| "../frontend/dist".into());
+    NamedFile::open(Path::new(&dist).join("index.html"))
+        .await
+        .ok()
+}
+#[launch]
+async fn rocket() -> _ {
+    dotenvy::dotenv().ok();
+    let secret = std::env::var("JWT_SECRET")
+        .expect("Set JWT_SECRET to a random secret of at least 32 bytes");
+    assert!(
+        secret.len() >= 32,
+        "JWT_SECRET must contain at least 32 bytes"
+    );
+    let pool = db::connect(&std::env::var("DATABASE_URL").expect("Set DATABASE_URL"))
+        .await
+        .expect("Database connection failed");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("Database migration failed");
+    let allowed_origins = std::env::var("ALLOWED_ORIGINS").ok();
+    let origins = allowed_origins.as_deref().unwrap_or("");
+    let origins: Vec<&str> = origins
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let cors = CorsOptions {
+        allowed_origins: AllowedOrigins::some_exact(&origins),
+        allowed_methods: [
+            Method::Get,
+            Method::Post,
+            Method::Put,
+            Method::Delete,
+            Method::Options,
+        ]
+        .into_iter()
+        .map(From::from)
+        .collect(),
+        allowed_headers: AllowedHeaders::some(&["Authorization", "Content-Type"]),
+        ..Default::default()
+    }
+    .to_cors()
+    .expect("Invalid CORS configuration");
+    let mut config = rocket::Config::figment();
+    if let Ok(port) = std::env::var("PORT") {
+        config = config.merge(("port", port.parse::<u16>().expect("PORT must be a number")));
+    }
+    let dist = std::env::var("FRONTEND_DIST").unwrap_or_else(|_| "../frontend/dist".into());
+    let app = rocket::custom(config)
+        .attach(headers::ResponseHeaders)
+        .manage(pool)
+        .manage(JwtSecret(secret))
+        .manage(AuthThrottle::default())
         .mount(
-            "/",
+            "/api",
             routes![
-                deck,
-                deck_new,
-                deck_shared,
-                cards_deck,
-                rows,
-                login,
+                health,
                 register,
-                protected,
-                all_options
+                login,
+                decks,
+                shared,
+                get_deck,
+                new_deck,
+                update_deck,
+                delete_deck,
+                cards,
+                add_card,
+                update_card,
+                delete_card,
+                review
             ],
         )
-        .launch()
-        .await?;
+        .mount("/", FileServer::from(dist).rank(10))
+        .mount("/", routes![spa]);
+    if allowed_origins.is_some() {
+        app.attach(cors)
+    } else {
+        app
+    }
+}
 
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_content_is_rejected() {
+        assert!(!valid_name("  "));
+        assert!(!valid_name(&"x".repeat(101)));
+        assert!(valid_name("Languages"));
+        assert!(!valid_card(&CardInput {
+            front: "".into(),
+            back: "answer".into()
+        }));
+    }
+    #[test]
+    fn authentication_attempts_are_bounded() {
+        let throttle = AuthThrottle::default();
+        for _ in 0..10 {
+            assert!(throttle.allow("alice"));
+        }
+        assert!(!throttle.allow("alice"));
+        assert!(throttle.allow("bob"));
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ownership_sharing_and_review_progress(pool: PgPool) {
+        use rocket::{
+            http::{ContentType, Header},
+            local::asynchronous::Client,
+        };
+        for id in ["owner", "visitor"] {
+            sqlx::query("INSERT INTO users(id,username,password) VALUES($1,$1,'unused-test-hash')")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let secret = "a-test-secret-that-is-long-enough-to-use";
+        let owner_token = utils::generate_token("owner", secret).unwrap();
+        let visitor_token = utils::generate_token("visitor", secret).unwrap();
+        let owner = || Header::new("Authorization", format!("Bearer {owner_token}"));
+        let visitor = || Header::new("Authorization", format!("Bearer {visitor_token}"));
+        let app = rocket::build()
+            .manage(pool.clone())
+            .manage(JwtSecret(secret.into()))
+            .manage(AuthThrottle::default())
+            .mount(
+                "/api",
+                routes![
+                    register,
+                    login,
+                    decks,
+                    shared,
+                    get_deck,
+                    new_deck,
+                    update_deck,
+                    delete_deck,
+                    cards,
+                    add_card,
+                    update_card,
+                    delete_card,
+                    review
+                ],
+            );
+        let client = Client::tracked(app).await.unwrap();
+        assert_eq!(
+            client.get("/api/deck").dispatch().await.status(),
+            Status::Unauthorized
+        );
+        assert_eq!(
+            client.get("/api/rows").dispatch().await.status(),
+            Status::NotFound
+        );
+        let deck: Deck = client
+            .post("/api/deck/new")
+            .header(owner())
+            .header(ContentType::JSON)
+            .body(r#"{"name":"Private facts"}"#)
+            .dispatch()
+            .await
+            .into_json()
+            .await
+            .unwrap();
+        let path = format!("/api/deck/{}", deck.id);
+        assert_eq!(
+            client
+                .get(&path)
+                .header(visitor())
+                .dispatch()
+                .await
+                .status(),
+            Status::NotFound
+        );
+        assert_eq!(
+            client
+                .get(format!("{path}/card"))
+                .header(visitor())
+                .dispatch()
+                .await
+                .status(),
+            Status::NotFound
+        );
+        let card: Card = client
+            .post(format!("{path}/card"))
+            .header(owner())
+            .header(ContentType::JSON)
+            .body(r#"{"front":"Question","back":"Answer"}"#)
+            .dispatch()
+            .await
+            .into_json()
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .put(&path)
+                .header(visitor())
+                .header(ContentType::JSON)
+                .body(r#"{"name":"Stolen","is_shared":true}"#)
+                .dispatch()
+                .await
+                .status(),
+            Status::NotFound
+        );
+        let shared_deck: Deck = client
+            .put(&path)
+            .header(owner())
+            .header(ContentType::JSON)
+            .body(r#"{"name":"Shared facts","is_shared":true}"#)
+            .dispatch()
+            .await
+            .into_json()
+            .await
+            .unwrap();
+        assert!(shared_deck.is_shared);
+        assert_eq!(
+            client
+                .get(&path)
+                .header(visitor())
+                .dispatch()
+                .await
+                .status(),
+            Status::Ok
+        );
+        assert_eq!(
+            client
+                .delete(format!("{path}/card/{}", card.id))
+                .header(visitor())
+                .dispatch()
+                .await
+                .status(),
+            Status::NotFound
+        );
+        let review_path = format!("{path}/card/{}/review", card.id);
+        assert_eq!(
+            client
+                .post(&review_path)
+                .header(visitor())
+                .header(ContentType::JSON)
+                .body(r#"{"grade":"good"}"#)
+                .dispatch()
+                .await
+                .status(),
+            Status::NoContent
+        );
+        let visitor_cards: Vec<Card> = client
+            .get(format!("{path}/card"))
+            .header(visitor())
+            .dispatch()
+            .await
+            .into_json()
+            .await
+            .unwrap();
+        let owner_cards: Vec<Card> = client
+            .get(format!("{path}/card"))
+            .header(owner())
+            .dispatch()
+            .await
+            .into_json()
+            .await
+            .unwrap();
+        assert!(!visitor_cards[0].due);
+        assert!(owner_cards[0].due);
+        assert_eq!(
+            client
+                .post(&review_path)
+                .header(owner())
+                .header(ContentType::JSON)
+                .body(r#"{"grade":"invalid"}"#)
+                .dispatch()
+                .await
+                .status(),
+            Status::BadRequest
+        );
+        // The URL works independently of navigation state, and new users can reuse a deck name.
+        let duplicate_name = client
+            .post("/api/deck/new")
+            .header(visitor())
+            .header(ContentType::JSON)
+            .body(r#"{"name":"Shared facts"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(duplicate_name.status(), Status::Ok);
+        assert_eq!(
+            client
+                .delete(&path)
+                .header(owner())
+                .dispatch()
+                .await
+                .status(),
+            Status::NoContent
+        );
+        let reviews: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM card_reviews")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reviews, 0);
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    async fn registration_login_and_validation(pool: PgPool) {
+        use rocket::{http::ContentType, local::asynchronous::Client};
+        let client = Client::tracked(
+            rocket::build()
+                .manage(pool)
+                .manage(JwtSecret("test-secret-of-at-least-32-bytes-long".into()))
+                .manage(AuthThrottle::default())
+                .mount("/api", routes![register, login]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client
+                .post("/api/register")
+                .header(ContentType::JSON)
+                .body(r#"{"username":"ab","password":"short"}"#)
+                .dispatch()
+                .await
+                .status(),
+            Status::BadRequest
+        );
+        let payload = r#"{"username":"learner","password":"a-test-password-123"}"#;
+        let response: LoginResponse = client
+            .post("/api/register")
+            .header(ContentType::JSON)
+            .body(payload)
+            .dispatch()
+            .await
+            .into_json()
+            .await
+            .unwrap();
+        assert!(!response.token.is_empty());
+        assert_eq!(
+            client
+                .post("/api/register")
+                .header(ContentType::JSON)
+                .body(payload)
+                .dispatch()
+                .await
+                .status(),
+            Status::Conflict
+        );
+        assert_eq!(
+            client
+                .post("/api/login")
+                .header(ContentType::JSON)
+                .body(payload)
+                .dispatch()
+                .await
+                .status(),
+            Status::Ok
+        );
+        assert_eq!(
+            client
+                .post("/api/login")
+                .header(ContentType::JSON)
+                .body(r#"{"username":"learner","password":"wrong-password"}"#)
+                .dispatch()
+                .await
+                .status(),
+            Status::Unauthorized
+        );
+    }
 }

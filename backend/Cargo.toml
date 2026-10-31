@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rocket = { version = "0.5.1", features = ["secrets", "json"] }
+rocket = { version = "0.5.1", default-features = false, features = ["secrets", "json"] }
 serde = { version = "1.0.219", features = ["derive"] }
-sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio"] }
-dotenv = "0.15.0"
-jsonwebtoken = "9.3.1"
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "migrate"] }
+dotenvy = "0.15.7"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"] }
 chrono = "0.4.41"
 rocket_cors = "0.6"
 bcrypt = "0.17"                                                        # or latest available

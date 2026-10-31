@@ -1,175 +1,168 @@
-import { Link, useLocation } from "react-router-dom";
 import { useEffect, useState } from "react";
-import { Card, Deck } from "../utils/models";
-import { fetchCards } from "../services/api";
-
-function DeckStudyPage() {
-  const { state } = useLocation();
-  const deck: Deck = state?.deck;
-
-  const [current, setCurrent] = useState(0);
-  const [flipped, setFlipped] = useState(false);
-  const [completed, setCompleted] = useState(false);
-  const [cards, setCards] = useState<Card[]>([]);
-  const [currentCard, setCurrentCard] = useState<Card | null>(null);
-  const [progress, setProgress] = useState(1);
-  const [loading, setLoading] = useState(true);
-
-  if (!deck) {
+import { Link, useParams } from "react-router-dom";
+import {
+  fetchDeck,
+  fetchCards,
+  reviewCard,
+  errorMessage,
+} from "../services/api";
+import type { Deck, Card, Grade } from "../utils/models";
+export default function DeckStudyPage() {
+  const { id = "" } = useParams();
+  const [deck, setDeck] = useState<Deck | null>(null),
+    [queue, setQueue] = useState<Card[]>([]),
+    [total, setTotal] = useState(0),
+    [done, setDone] = useState(0),
+    [flipped, setFlipped] = useState(false),
+    [loading, setLoading] = useState(true),
+    [busy, setBusy] = useState(false),
+    [error, setError] = useState(""),
+    [retry, setRetry] = useState(0);
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError("");
+    setDone(0);
+    setFlipped(false);
+    Promise.all([fetchDeck(id), fetchCards(id)])
+      .then(([d, c]) => {
+        if (active) {
+          const due = c.filter((card) => card.due);
+          setDeck(d);
+          setQueue(due);
+          setTotal(due.length);
+        }
+      })
+      .catch((e) => {
+        if (active) setError(errorMessage(e));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [id, retry]);
+  async function answer(grade: Grade) {
+    if (!queue[0] || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await reviewCard(id, queue[0].id, grade);
+      setQueue((q) => (grade === "again" ? [...q.slice(1), q[0]] : q.slice(1)));
+      if (grade !== "again") setDone((d) => d + 1);
+      setFlipped(false);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  const card = queue[0];
+  if (loading)
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-gray-900 text-white px-6">
-        <div className="bg-gray-800 rounded-lg shadow-lg p-10 max-w-md text-center">
-          <h1 className="text-4xl font-bold mb-4">Oops!</h1>
-          <p className="mb-6 text-gray-300">
-            We couldn’t find the deck you’re looking for.
+      <p className="empty-state" role="status">
+        Getting your next breakthrough ready…
+      </p>
+    );
+  if (!deck)
+    return (
+      <div className="empty-state">
+        <p role="alert">{error}</p>
+        <button className="button" onClick={() => setRetry((r) => r + 1)}>
+          Try again
+        </button>
+      </div>
+    );
+  return (
+    <section className="study-page">
+      <Link className="back-link" to={`/deck/${id}`}>
+        ← Back to {deck.name}
+      </Link>
+      {error && (
+        <p className="error-box" role="alert">
+          {error}
+        </p>
+      )}
+      {!card ? (
+        <div className="study-finished">
+          <span className="finish-mark" aria-hidden="true">
+            ✳
+          </span>
+          <h1>
+            {total ? "A little wiser. Nicely done." : "You’re all caught up."}
+          </h1>
+          <p>
+            {total
+              ? `You completed ${done} ${done === 1 ? "card" : "cards"}. Your progress is saved.`
+              : "There are no cards due right now. Come back later, or add more to your deck."}
           </p>
-          <Link
-            to="/"
-            className="inline-block bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition"
-          >
-            Go to Dashboard
+          <Link className="button" to={`/deck/${id}`}>
+            Back to deck →
           </Link>
         </div>
-      </div>
-    );
-  }
-
-  const handleAnswer = (quality: string) => {
-    console.log(`User selected: ${quality}`);
-    setProgress(((current + 1) / cards.length) * 100);
-    setFlipped(false);
-
-    if (current === cards.length - 1) {
-      setCompleted(true);
-    } else {
-      const nextIndex = current + 1;
-      setCurrent(nextIndex);
-      setCurrentCard(cards[nextIndex]);
-    }
-  };
-
-  useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true);
-      const fetchedCards = await fetchCards(deck.id);
-      if (fetchedCards.length === 0) {
-        setLoading(false);
-        setCompleted(true);
-        return;
-      }
-      setCards(fetchedCards);
-      setCurrentCard(fetchedCards[0]);
-      setLoading(false);
-    };
-
-    fetchData();
-  }, [deck.id]);
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-screen bg-gray-900 text-white">
-        <div className="text-center">
-          <svg
-            className="animate-spin h-12 w-12 text-indigo-500 mx-auto mb-4"
-            xmlns="http://www.w3.org/2000/svg"
-            fill="none"
-            viewBox="0 0 24 24"
-          >
-            <circle
-              className="opacity-25"
-              cx="12"
-              cy="12"
-              r="10"
-              stroke="currentColor"
-              strokeWidth="4"
-            ></circle>
-            <path
-              className="opacity-75"
-              fill="currentColor"
-              d="M4 12a8 8 0 018-8v8H4z"
-            ></path>
-          </svg>
-          <p>Loading cards...</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (completed) {
-    return (
-      <div className="flex flex-col items-center justify-center min-h-screen p-6 bg-gray-900 text-white">
-        <div className="w-full max-w-3xl bg-green-700 rounded-xl shadow p-8 mb-10 text-center text-xl font-medium">
-          🎉 You just completed the deck! 🎉
-        </div>
-
-        <Link
-          className="bg-blue-600 hover:bg-blue-700 px-6 py-3 rounded-lg font-semibold"
-          to="/"
-        >
-          Go Back
-        </Link>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex flex-col items-center justify-center min-h-screen p-6 bg-gray-900 text-white">
-      {/* Header */}
-      <div className="w-full max-w-3xl mb-6 text-center">
-        <h1 className="text-2xl font-bold mb-2">Studying: {deck.name}</h1>
-        <p className="text-gray-400">
-          Card {current + 1} of {cards.length}
-        </p>
-        <div className="w-full h-2 bg-gray-700 rounded-full mt-4">
-          <div
-            className="h-full bg-blue-500 rounded-full transition-all duration-300"
-            style={{ width: `${progress}%` }}
-          />
-        </div>
-      </div>
-
-      {/* Card */}
-      <div
-        className="w-full max-w-3xl bg-gray-800 rounded-xl shadow p-8 mb-10 text-center text-xl font-medium cursor-pointer transition duration-300 hover:brightness-110"
-        onClick={() => setFlipped(true)}
-      >
-        <p>{flipped ? currentCard?.back : currentCard?.front}</p>
-        <p className="text-sm text-gray-400 mt-2">
-          {!flipped && " (click to flip)"}
-        </p>
-      </div>
-
-      {/* Buttons */}
-      {flipped && (
-        <div className="flex flex-wrap justify-center gap-4">
+      ) : (
+        <>
+          <header className="study-heading">
+            <p className="eyebrow">A MOMENT TO FOCUS</p>
+            <h1>{deck.name}</h1>
+            <p>
+              {done} of {total} cards completed
+            </p>
+            <progress value={done} max={total} aria-label="Study progress" />
+          </header>
           <button
-            className="bg-red-600 hover:bg-red-700 px-6 py-3 rounded-lg font-semibold"
-            onClick={() => handleAnswer("again")}
+            className={`flashcard ${flipped ? "is-flipped" : ""}`}
+            onClick={() => setFlipped((f) => !f)}
+            disabled={busy}
+            aria-label={`${flipped ? card.back : card.front}. ${flipped ? "Show question" : "Show answer"}`}
           >
-            Again
+            <span className="eyebrow">
+              {flipped ? "THE ANSWER" : "THINK IT THROUGH"}
+            </span>
+            <span className="flashcard-content">
+              {flipped ? card.back : card.front}
+            </span>
+            <span className="flip-hint">
+              {flipped
+                ? "Click to revisit the question"
+                : "Click to reveal the answer"}{" "}
+              ↻
+            </span>
           </button>
-          <button
-            className="bg-yellow-500 hover:bg-yellow-600 px-6 py-3 rounded-lg font-semibold"
-            onClick={() => handleAnswer("hard")}
-          >
-            Hard
-          </button>
-          <button
-            className="bg-green-600 hover:bg-green-700 px-6 py-3 rounded-lg font-semibold"
-            onClick={() => handleAnswer("good")}
-          >
-            Good
-          </button>
-          <button
-            className="bg-blue-600 hover:bg-blue-700 px-6 py-3 rounded-lg font-semibold"
-            onClick={() => handleAnswer("easy")}
-          >
-            Easy
-          </button>
-        </div>
+          {flipped ? (
+            <div className="review-actions">
+              <p>How did that feel?</p>
+              <div>
+                {(["again", "hard", "good", "easy"] as const).map((grade) => (
+                  <button
+                    className={`grade grade-${grade}`}
+                    key={grade}
+                    disabled={busy}
+                    onClick={() => void answer(grade)}
+                  >
+                    {grade[0].toUpperCase() + grade.slice(1)}
+                    <small>
+                      {grade === "again"
+                        ? "Repeat this session"
+                        : grade === "hard"
+                          ? "A little sooner"
+                          : grade === "good"
+                            ? "A little later"
+                            : "More time away"}
+                    </small>
+                  </button>
+                ))}
+              </div>
+              {busy && <p role="status">Saving your review…</p>}
+            </div>
+          ) : (
+            <p className="study-caption">
+              Take your time. Remembering is a practice.
+            </p>
+          )}
+        </>
       )}
-    </div>
+    </section>
   );
 }
-
-export default DeckStudyPage;
