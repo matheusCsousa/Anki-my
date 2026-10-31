@@ -1,100 +1,28 @@
-# Backend — Anki-My
+# Backend
 
-REST API built with Rust and [Rocket](https://rocket.rs/). Handles authentication, deck and card management, and serves data to the frontend.
+The Rust/Rocket API is mounted at `/api`. PostgreSQL migrations run at startup. See the root README for setup and DEPLOYMENT.md for hosting.
 
-## Tech
+Authenticated requests use `Authorization: Bearer <token>`. Private decks are visible only to their owner; shared decks can be studied by signed-in users. Only an owner may mutate decks or cards.
 
-- Rust (edition 2024)
-- Rocket 0.5 + rocket_cors
-- SQLx + PostgreSQL
-- JWT (jsonwebtoken) + bcrypt
-- UUID v4 for all IDs
+| Method | Endpoint                            | Behavior                                |
+| ------ | ----------------------------------- | --------------------------------------- |
+| GET    | `/api/health`                       | Database readiness                      |
+| POST   | `/api/register`                     | Create account; returns JWT             |
+| POST   | `/api/login`                        | Sign in; returns JWT                    |
+| GET    | `/api/deck`                         | Own decks and actual card/due counts    |
+| GET    | `/api/deck/shared`                  | Shared decks (up to 200)                |
+| POST   | `/api/deck/new`                     | Create `{name, is_shared}`              |
+| GET    | `/api/deck/:id`                     | Load accessible deck                    |
+| PUT    | `/api/deck/:id`                     | Rename/change sharing                   |
+| DELETE | `/api/deck/:id`                     | Delete owned deck, cards, and reviews   |
+| GET    | `/api/deck/:id/card`                | Accessible cards with per-user due flag |
+| POST   | `/api/deck/:id/card`                | Create `{front, back}`                  |
+| PUT    | `/api/deck/:id/card/:cardId`        | Edit owned card                         |
+| DELETE | `/api/deck/:id/card/:cardId`        | Delete owned card                       |
+| POST   | `/api/deck/:id/card/:cardId/review` | Save `{grade}`                          |
 
-## Environment Variables
+Registration: username 3–40 ASCII letters/digits/underscore/hyphen; password 8–72 UTF-8 bytes. Deck names: 1–100 characters. Card sides: 1–10,000 characters. JSON requests are capped at 64 KiB.
 
-Create a `.env` file in `/backend`:
+Review grades: `again` schedules one minute ahead; `hard` schedules at least one day; `good` at least three; `easy` at least seven. Existing intervals grow by the factors in `utils::next_interval`, capped at 365 days. The frontend repeats Again cards in the current session. Scheduling uses PostgreSQL timestamps, and reviews are stored per user/card.
 
-```env
-DATABASE_URL=postgres://user:password@localhost/ankimy
-JWT_SECRET=your_secret_here
-ROCKET_SECRET_KEY=your_rocket_key_here
-```
-
-## Run
-
-```bash
-cargo run
-```
-
-Runs on port `8000` by default (`Rocket.toml`).
-
-## API Endpoints
-
-### Auth
-
-| Method | Route | Auth | Description |
-|---|---|---|---|
-| POST | `/login` | No | Returns JWT token |
-| POST | `/register` | No | Creates user, returns JWT token |
-
-**Request body (both):**
-```json
-{ "username": "string", "password": "string" }
-```
-
-**Response:**
-```json
-{ "token": "eyJ..." }
-```
-
-### Decks
-
-All deck routes require `Authorization: Bearer <token>`.
-
-| Method | Route | Description |
-|---|---|---|
-| GET | `/deck` | List decks owned by the authenticated user |
-| POST | `/deck/new` | Create a new deck |
-| GET | `/deck/shared` | List all public shared decks |
-| GET | `/deck/:id/card` | List all cards in a deck |
-
-**POST `/deck/new` body:**
-```json
-{ "name": "string" }
-```
-
-Returns `409 Conflict` if deck name already exists.
-
-## Project Structure
-
-```
-src/
-├── main.rs         # Route handlers, CORS config, Rocket setup
-├── models/mod.rs   # Structs: User, Deck, Card, AuthUser, Claims
-├── db.rs           # PostgreSQL connection pool (SQLx)
-└── utils/mod.rs    # JWT generate/verify helpers
-```
-
-## Database Schema (expected)
-
-```sql
-CREATE TABLE users (
-    id       TEXT PRIMARY KEY,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL
-);
-
-CREATE TABLE decks (
-    id        TEXT PRIMARY KEY,
-    name      TEXT NOT NULL,
-    user_id   TEXT REFERENCES users(id),
-    is_shared BOOLEAN DEFAULT false
-);
-
-CREATE TABLE cards (
-    id      TEXT PRIMARY KEY,
-    front   TEXT NOT NULL,
-    back    TEXT NOT NULL,
-    deck_id TEXT REFERENCES decks(id)
-);
-```
+All configuration comes from environment variables: `DATABASE_URL`, `JWT_SECRET` (32+ bytes), optionally `PORT`, `ROCKET_SECRET_KEY`, `FRONTEND_DIST`, and `ALLOWED_ORIGINS`. CORS is enabled only when an explicit allowlist is supplied.

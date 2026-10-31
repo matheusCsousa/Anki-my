@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: anki-my
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ROCKET_SECRET_KEY
+        generateValue: true
+      - key: ROCKET_ADDRESS
+        value: 0.0.0.0
