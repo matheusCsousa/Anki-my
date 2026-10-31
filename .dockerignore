@@ -1,0 +1,8 @@
+**/node_modules
+**/target
+**/dist
+**/.env
+**/.env.*
+.git
+.tooling
+*.patch

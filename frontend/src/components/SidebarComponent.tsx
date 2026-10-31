@@ -1,82 +1,38 @@
-import { Link } from "react-router-dom";
-
-function SidebarComponent() {
+import { NavLink, useNavigate } from "react-router-dom";
+import Brand from "./Brand";
+export default function SidebarComponent() {
+  const navigate = useNavigate();
   return (
-    <div className="hidden md:flex flex-col w-64 bg-gray-800">
-      <div className="flex items-center justify-center h-16 bg-gray-900">
-        <span className="text-white font-bold uppercase">Anki-my</span>
+    <aside className="sidebar">
+      <Brand />
+      <div className="sidebar-label">YOUR WORKSPACE</div>
+      <nav aria-label="Workspace">
+        <NavLink to="/app" end>
+          <span aria-hidden="true">▦</span>My decks
+        </NavLink>
+        <NavLink to="/deck/shared">
+          <span aria-hidden="true">◎</span>Discover decks
+        </NavLink>
+        <NavLink to="/deck/new">
+          <span aria-hidden="true">＋</span>Create a deck
+        </NavLink>
+      </nav>
+      <div className="sidebar-bottom">
+        <p>
+          A little practice.
+          <br />
+          <strong>A little more possibility.</strong>
+        </p>
+        <button
+          className="text-button"
+          onClick={() => {
+            localStorage.removeItem("token");
+            navigate("/login");
+          }}
+        >
+          Sign out ↗
+        </button>
       </div>
-
-      <div className="flex flex-col flex-1 overflow-y-auto">
-        <nav className="flex-1 px-2 py-4 bg-gray-800">
-          <Link
-            to="/"
-            className="flex items-center px-4 py-2 mt-2 text-gray-100 hover:bg-gray-700"
-          >
-            <svg
-              className="h-6 w-6 mr-2"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-            </svg>
-            Dashboard
-          </Link>
-
-          <Link
-            to="/deck/shared"
-            className="flex items-center px-4 py-2 mt-2 text-gray-100 hover:bg-gray-700"
-          >
-            <svg
-              className="h-6 w-6 mr-2"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-            </svg>
-            Shared Decks
-          </Link>
-
-          <Link
-            to="/deck/new"
-            className="flex items-center px-4 py-2 mt-2 text-gray-100 hover:bg-gray-700"
-          >
-            <svg
-              className="h-6 w-6 mr-2"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-            New Deck
-          </Link>
-
-          <Link
-            to="/login"
-            className="flex items-center px-4 py-2 mt-2 text-gray-100 hover:bg-gray-700"
-          >
-            <svg
-              className="h-6 w-6 mr-2"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeWidth={2}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M15 12H3m0 0l4-4m-4 4l4 4m13-7v10a2 2 0 01-2 2H9a2 2 0 01-2-2V5a2 2 0 012-2h7"
-              />
-            </svg>
-            Logout
-          </Link>
-        </nav>
-      </div>
-    </div>
+    </aside>
   );
 }
-
-export default SidebarComponent;
