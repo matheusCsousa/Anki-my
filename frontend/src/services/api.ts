@@ -1,4 +1,4 @@
-import type { Deck, Card, Grade } from "../utils/models";
+import type { Deck, Card, Grade, ReviewResult } from "../utils/models";
 const apiUrl = (import.meta.env.VITE_API_URL || "/api").replace(/\/$/, "");
 export class ApiError extends Error {
   status: number;
@@ -97,11 +97,20 @@ export const deleteCard = (deckId: string, id: string) =>
     `/deck/${encodeURIComponent(deckId)}/card/${encodeURIComponent(id)}`,
     { method: "DELETE" },
   );
-export const reviewCard = (deckId: string, id: string, grade: Grade) =>
-  request<void>(
-    `/deck/${encodeURIComponent(deckId)}/card/${encodeURIComponent(id)}/review`,
-    { method: "POST", body: JSON.stringify({ grade }) },
-  );
+export async function reviewCard(deckId: string, id: string, grade: Grade) {
+  try {
+    return await request<ReviewResult>(
+      `/deck/${encodeURIComponent(deckId)}/card/${encodeURIComponent(id)}/review`,
+      { method: "POST", body: JSON.stringify({ grade }) },
+    );
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409) {
+      throw new ApiError(409, "This card was already reviewed and is scheduled for later. The study queue will refresh shortly.");
+    }
+    throw error;
+  }
+}
+
 export function errorMessage(error: unknown) {
   return error instanceof Error
     ? error.message

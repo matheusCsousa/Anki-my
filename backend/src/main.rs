@@ -272,7 +272,11 @@ async fn delete_deck(id: &str, user: AuthUser, pool: &State<PgPool>) -> Result<S
 #[get("/deck/<id>/card")]
 async fn cards(id: &str, user: AuthUser, pool: &State<PgPool>) -> Result<Json<Vec<Card>>, Status> {
     can_access(pool, &user.user_id, id, false).await?;
-    Ok(Json(sqlx::query_as::<_, Card>("SELECT c.id,c.front,c.back,(r.due_at IS NULL OR r.due_at<=NOW()) AS due FROM cards c LEFT JOIN card_reviews r ON r.card_id=c.id AND r.user_id=$1 WHERE c.deck_id=$2 ORDER BY c.id").bind(user.user_id).bind(id).fetch_all(pool.inner()).await.map_err(db_error)?))
+    let mut result = sqlx::query_as::<_, Card>("SELECT c.id,c.front,c.back,(r.due_at IS NULL OR r.due_at<=NOW()) AS due,(EXTRACT(EPOCH FROM r.due_at)*1000)::bigint AS due_at,COALESCE(r.interval_days,0) AS interval_days FROM cards c LEFT JOIN card_reviews r ON r.card_id=c.id AND r.user_id=$1 WHERE c.deck_id=$2 ORDER BY c.id").bind(user.user_id).bind(id).fetch_all(pool.inner()).await.map_err(db_error)?;
+    for card in &mut result {
+        card.review_delays = utils::review_delays(card.interval_days);
+    }
+    Ok(Json(result))
 }
 #[post("/deck/<id>/card", data = "<data>")]
 async fn add_card(
@@ -294,6 +298,9 @@ async fn add_card(
         front: data.front.trim().into(),
         back: data.back.trim().into(),
         due: true,
+        due_at: None,
+        interval_days: 0,
+        review_delays: utils::review_delays(0),
     }))
 }
 #[put("/deck/<id>/card/<card_id>", data = "<data>")]
@@ -333,7 +340,7 @@ async fn review(
     data: Json<ReviewInput>,
     user: AuthUser,
     pool: &State<PgPool>,
-) -> Result<Status, Status> {
+) -> Result<Json<ReviewResult>, Status> {
     if utils::next_interval(0, &data.grade).is_none() {
         return Err(Status::BadRequest);
     }
@@ -343,19 +350,26 @@ async fn review(
         return Err(Status::NotFound);
     }
     sqlx::query("INSERT INTO card_reviews(user_id,card_id,review_count) VALUES($1,$2,0) ON CONFLICT DO NOTHING").bind(&user.user_id).bind(card_id).execute(&mut *tx).await.map_err(db_error)?;
-    let previous: i32 = sqlx::query_scalar(
-        "SELECT interval_days FROM card_reviews WHERE user_id=$1 AND card_id=$2 FOR UPDATE",
+    let (previous, due): (i32, bool) = sqlx::query_as(
+        "SELECT interval_days,due_at<=clock_timestamp() FROM card_reviews WHERE user_id=$1 AND card_id=$2 FOR UPDATE",
     )
     .bind(&user.user_id)
     .bind(card_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(db_error)?;
+    if !due {
+        return Err(Status::Conflict);
+    }
     let days = utils::next_interval(previous, &data.grade).ok_or(Status::BadRequest)?;
-    let seconds = if days == 0 { 60 } else { days * 86400 };
-    sqlx::query("UPDATE card_reviews SET interval_days=$1,due_at=NOW()+($2::int*INTERVAL '1 second'),reviewed_at=NOW(),review_count=review_count+1 WHERE user_id=$3 AND card_id=$4").bind(days).bind(seconds).bind(user.user_id).bind(card_id).execute(&mut *tx).await.map_err(db_error)?;
+    let seconds = utils::review_delay(previous, &data.grade).ok_or(Status::BadRequest)?;
+    let due_at: i64 = sqlx::query_scalar("UPDATE card_reviews SET interval_days=$1,due_at=clock_timestamp()+($2::int*INTERVAL '1 second'),reviewed_at=clock_timestamp(),review_count=review_count+1 WHERE user_id=$3 AND card_id=$4 RETURNING (EXTRACT(EPOCH FROM due_at)*1000)::bigint").bind(days).bind(seconds).bind(user.user_id).bind(card_id).fetch_one(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
-    Ok(Status::NoContent)
+    Ok(Json(ReviewResult {
+        due_at,
+        interval_days: days,
+        delay_seconds: seconds,
+    }))
 }
 #[get("/<path..>", rank = 20)]
 async fn spa(path: PathBuf) -> Option<NamedFile> {
@@ -471,6 +485,96 @@ mod tests {
         }
         assert!(!throttle.allow("alice"));
         assert!(throttle.allow("bob"));
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    async fn grades_persist_delays_and_wait_until_due(pool: PgPool) {
+        use rocket::{
+            http::{ContentType, Header},
+            local::asynchronous::Client,
+        };
+        sqlx::query("INSERT INTO users(id,username,password) VALUES('student','student','test')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO decks(id,name,user_id) VALUES('deck','Review','student')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO cards(id,front,back,deck_id) VALUES('card','Question','Answer','deck')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let token = utils::generate_token("student", "review-test-secret").unwrap();
+        let auth = || Header::new("Authorization", format!("Bearer {token}"));
+        let client = Client::tracked(
+            rocket::build()
+                .manage(pool.clone())
+                .manage(JwtSecret("review-test-secret".into()))
+                .mount("/api", routes![cards, review]),
+        )
+        .await
+        .unwrap();
+        for grade in ["again", "hard", "good", "easy"] {
+            sqlx::query("INSERT INTO card_reviews(user_id,card_id,interval_days,due_at,review_count) VALUES('student','card',10,NOW()-INTERVAL '1 second',0) ON CONFLICT(user_id,card_id) DO UPDATE SET interval_days=10,due_at=NOW()-INTERVAL '1 second',review_count=0").execute(&pool).await.unwrap();
+            let before: Vec<Card> = client
+                .get("/api/deck/deck/card")
+                .header(auth())
+                .dispatch()
+                .await
+                .into_json()
+                .await
+                .unwrap();
+            assert!(before[0].due);
+            let expected = utils::review_delay(10, grade).unwrap();
+            let payload = format!("{{\"grade\":\"{grade}\"}}");
+            let response = client
+                .post("/api/deck/deck/card/card/review")
+                .header(auth())
+                .header(ContentType::JSON)
+                .body(&payload)
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Ok);
+            let result: ReviewResult = response.into_json().await.unwrap();
+            assert_eq!(result.delay_seconds, expected);
+            let (remaining,count):(f64,i32)=sqlx::query_as("SELECT EXTRACT(EPOCH FROM due_at-clock_timestamp())::float8,review_count FROM card_reviews WHERE user_id='student' AND card_id='card'").fetch_one(&pool).await.unwrap();
+            assert!((remaining - expected as f64).abs() < 5.0);
+            assert_eq!(count, 1);
+            let reopened: Vec<Card> = client
+                .get("/api/deck/deck/card")
+                .header(auth())
+                .dispatch()
+                .await
+                .into_json()
+                .await
+                .unwrap();
+            assert!(!reopened[0].due);
+            assert_eq!(reopened[0].due_at, Some(result.due_at));
+            assert_eq!(reopened[0].interval_days, result.interval_days);
+            assert_eq!(
+                client
+                    .post("/api/deck/deck/card/card/review")
+                    .header(auth())
+                    .header(ContentType::JSON)
+                    .body(&payload)
+                    .dispatch()
+                    .await
+                    .status(),
+                Status::Conflict
+            );
+            sqlx::query("UPDATE card_reviews SET due_at=NOW()-INTERVAL '1 second' WHERE user_id='student' AND card_id='card'").execute(&pool).await.unwrap();
+            let ready: Vec<Card> = client
+                .get("/api/deck/deck/card")
+                .header(auth())
+                .dispatch()
+                .await
+                .into_json()
+                .await
+                .unwrap();
+            assert!(ready[0].due);
+        }
     }
     #[sqlx::test(migrations = "./migrations")]
     async fn ownership_sharing_and_review_progress(pool: PgPool) {
@@ -610,7 +714,7 @@ mod tests {
                 .dispatch()
                 .await
                 .status(),
-            Status::NoContent
+            Status::Ok
         );
         let visitor_cards: Vec<Card> = client
             .get(format!("{path}/card"))
