@@ -76,6 +76,10 @@ pub struct Card {
     pub front: String,
     pub back: String,
     pub due: bool,
+    pub due_at: Option<i64>,
+    pub interval_days: i32,
+    #[sqlx(skip)]
+    pub review_delays: ReviewDelays,
 }
 #[derive(Deserialize)]
 #[serde(crate = "rocket::serde")]
@@ -87,4 +91,20 @@ pub struct CardInput {
 #[serde(crate = "rocket::serde")]
 pub struct ReviewInput {
     pub grade: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(crate = "rocket::serde")]
+pub struct ReviewDelays {
+    pub again: i32,
+    pub hard: i32,
+    pub good: i32,
+    pub easy: i32,
+}
+#[derive(Serialize, Deserialize, sqlx::FromRow)]
+#[serde(crate = "rocket::serde")]
+pub struct ReviewResult {
+    pub due_at: i64,
+    pub interval_days: i32,
+    pub delay_seconds: i32,
 }

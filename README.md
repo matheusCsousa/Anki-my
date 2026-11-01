@@ -67,3 +67,34 @@ Backend database integration tests require `DATABASE_URL` for a local PostgreSQL
 ## Public deployment
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for the free Render + Neon setup. The checked-in Render Blueprint deploys the complete app as one Docker service. Never commit real secrets.
+
+## Review scheduling
+
+Answer buttons show the actual interval calculated by the server. For a new card:
+
+| Answer | Next review |
+| --- | --- |
+| Again | 1 minute |
+| Hard | 1 day |
+| Good | 3 days |
+| Easy | 7 days |
+
+For later reviews, Hard grows the previous day interval by 1.2 (rounded up),
+Good doubles it (minimum 3 days), and Easy triples it (minimum 7 days), capped
+at 365 days. Again resets the day interval and schedules a one-minute relearning
+review. This is a simple interval scheduler, not FSRS or SM-2.
+
+Every successful answer removes the card from the active queue until its saved
+PostgreSQL due time. The study page checks for returning cards, including while
+other cards are being studied, and refreshes when returning to the tab. Newly due
+cards join behind the visible card. When waiting, the page shows the next due
+date in the user's local timezone. Scheduling remains per user, including shared
+decks, and survives reloads and server restarts. The server rejects duplicate or
+early submissions; failed saves leave the card available to retry.
+
+No database migration or background worker is required: due cards are determined
+from their saved timestamps when queried. Deploy backend and frontend together.
+
+Frontend scheduling checks: `node --experimental-strip-types --test tests/study.test.mjs`
+from `frontend/`. Backend integration tests verify each grade's persisted due time,
+reopening a deck, early-review rejection, and eligibility once the due time passes.

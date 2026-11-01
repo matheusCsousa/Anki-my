@@ -30,9 +30,40 @@ pub fn next_interval(previous: i32, grade: &str) -> Option<i32> {
     })
 }
 
+pub fn review_delay(previous: i32, grade: &str) -> Option<i32> {
+    next_interval(previous, grade).map(|days| if days == 0 { 60 } else { days * 86400 })
+}
+pub fn review_delays(previous: i32) -> crate::models::ReviewDelays {
+    crate::models::ReviewDelays {
+        again: review_delay(previous, "again").unwrap(),
+        hard: review_delay(previous, "hard").unwrap(),
+        good: review_delay(previous, "good").unwrap(),
+        easy: review_delay(previous, "easy").unwrap(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn previews_match_saved_delays() {
+        for previous in [0, 1, 10, 365] {
+            let preview = review_delays(previous);
+            for (grade, seconds) in [
+                ("again", preview.again),
+                ("hard", preview.hard),
+                ("good", preview.good),
+                ("easy", preview.easy),
+            ] {
+                assert_eq!(Some(seconds), review_delay(previous, grade));
+                assert!(seconds > 0);
+            }
+        }
+        assert_eq!(review_delay(0, "again"), Some(60));
+        assert_eq!(review_delay(0, "hard"), Some(86400));
+        assert_eq!(review_delay(0, "good"), Some(3 * 86400));
+        assert_eq!(review_delay(0, "easy"), Some(7 * 86400));
+    }
     #[test]
     fn grades_schedule_different_intervals() {
         assert_eq!(next_interval(0, "again"), Some(0));
